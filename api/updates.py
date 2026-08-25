@@ -1680,6 +1680,90 @@ def _purge_agent_pycache(repo_dir: Path) -> None:
         pass
 
 
+# ── Canonical restart command resolution ────────────────────────────────────
+# A self-update restart must replace the WebUI server with ONE canonical
+# entrypoint. Replaying the current process's sys.argv is wrong: sys.argv
+# describes whoever launched this interpreter (pytest, bootstrap.py, a shell
+# wrapper), not the server. Under pytest the replay re-runs pytest (a
+# fixed-point fork-bomb); under bootstrap it re-runs the wrapper. The
+# canonical source launch is [pythonw|python, REPO_ROOT/server.py] — the same
+# shape bootstrap.py uses (bootstrap.py:646) — and frozen builds re-run the
+# binary itself (sys.argv is already canonical there).
+
+_SUPERVISOR_ENV_VARS = (
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "NOTIFY_SOCKET",
+    "XPC_SERVICE_NAME",
+    "SUPERVISOR_ENABLED",
+)
+
+
+def _is_real_supervisor_value(name: str, value: str) -> bool:
+    """Filter known-noise env values that aren't actual supervisors.
+
+    Mirrors bootstrap.py semantics: most supervisor env vars are only set by
+    the supervisor we care about, so any non-empty value is meaningful.
+    XPC_SERVICE_NAME is the exception — macOS launchd sets it in every
+    Terminal-spawned shell with values like "0" or
+    "application.com.apple.Terminal.<UUID>"; a real launchd service has a
+    reverse-DNS Label like "com.example.foo".
+    """
+    if not value:
+        return False
+    if name == "XPC_SERVICE_NAME":
+        if value == "0":
+            return False
+        if value.startswith("application."):
+            return False
+    return True
+
+
+def _detect_supervisor() -> str | None:
+    """Return the name of the detected supervisor env var, or None.
+
+    Pure inspection of os.environ — no side effects. Mirrors bootstrap.py's
+    supervisor detection so a server launched under a supervisor (systemd /
+    launchd / supervisord / explicit HERMES_WEBUI_FOREGROUND opt-in) can tell
+    that the supervisor owns its replacement.
+    """
+    explicit = os.environ.get("HERMES_WEBUI_FOREGROUND", "").strip().lower()
+    if explicit in ("1", "true", "yes", "on"):
+        return "HERMES_WEBUI_FOREGROUND"
+    for name in _SUPERVISOR_ENV_VARS:
+        value = os.environ.get(name, "")
+        if _is_real_supervisor_value(name, value):
+            return name
+    return None
+
+
+def _restart_command() -> tuple[list[str], str, dict]:
+    """Resolve the ONE canonical replacement command for a self-update restart.
+
+    Returns ``(args, cwd, env)``:
+
+    * Frozen/packaged build (PyInstaller, embedded zipapp, ...): the binary
+      IS the entrypoint, so ``sys.argv`` is already canonical — re-run it
+      as-is (passing [sys.executable] + sys.argv would re-insert the binary
+      as argv[1] and never reach bind()).
+    * Source checkout: ``[pythonw|python, REPO_ROOT/server.py]`` in the repo
+      root with a copy of the current environment. Never touches sys.argv —
+      the caller's argv describes the launcher (pytest, bootstrap.py, a shell
+      wrapper), not the server.
+
+    The pythonw.exe substitution (win32 only) keeps the restarted server from
+    creating a visible console window (#4626).
+    """
+    if getattr(sys, "frozen", False):
+        return list(sys.argv), os.getcwd(), os.environ.copy()
+    exe = sys.executable
+    if sys.platform == "win32" and exe.lower().endswith("python.exe"):
+        w_exe = exe[:-4] + "w.exe"  # python.exe -> pythonw.exe
+        if os.path.isfile(w_exe):
+            exe = w_exe
+    return [exe, str(REPO_ROOT / "server.py")], str(REPO_ROOT), os.environ.copy()
+
+
 def _schedule_restart(delay: float = 2.0) -> None:
     """Re-exec this process after *delay* seconds.
 
@@ -1688,8 +1772,8 @@ def _schedule_restart(delay: float = 2.0) -> None:
     new Python modules in sys.modules.
 
     os.execv() replaces the current process image with a fresh interpreter
-    running the same argv — sessions are preserved on disk, the HTTP port
-    is reclaimed within the delay window, and the client's own
+    running the canonical server entrypoint — sessions are preserved on disk,
+    the HTTP port is reclaimed within the delay window, and the client's own
     ``setTimeout(() => location.reload(), 2500)`` lands after the restart.
 
     Coordinates with ``_apply_lock``: when the user updates both webui
@@ -1725,67 +1809,61 @@ def _schedule_restart(delay: float = 2.0) -> None:
                 _purge_agent_pycache(Path(_AGENT_DIR))
             _purge_agent_pycache(REPO_ROOT)
             try:
-                # Re-exec into the just-pulled image.
+                # Re-exec into the just-pulled image.  The replacement
+                # command is resolved by _restart_command() to ONE canonical
+                # entrypoint — never a replay of this process's sys.argv,
+                # which describes the launcher (pytest, bootstrap.py, a shell
+                # wrapper), not the server.
                 #
-                # sys.argv[0]'s meaning depends on how the server was launched:
-                #
-                #   * Source checkout (`python server.py` via bootstrap.py /
-                #     ctl.sh / start.sh): sys.argv[0] is the SCRIPT path
-                #     (e.g. "/root/hermes-webui/server.py"), sys.executable is
-                #     the interpreter. CPython treats argv[1] as the script to
-                #     run, so we must pass [sys.executable] + sys.argv.
-                #
+                #   * Source checkout: [pythonw|python, REPO_ROOT/server.py]
+                #     in the repo root — the same canonical shape bootstrap.py
+                #     uses (bootstrap.py:646).
                 #   * Frozen/packaged build (PyInstaller, embedded zipapp,
-                #     etc.): sys.argv[0] == sys.executable == <binary>. Passing
-                #     [sys.executable] + sys.argv would re-insert the binary as
-                #     argv[1] — the kernel launches it, the interpreter treats
-                #     the binary itself as the "script" to run, and execv
-                #     effectively becomes a recursive no-op that never reaches
-                #     bind(), leaving the WebUI stuck "offline" after every
-                #     self-update. Pass argv as-is instead.
-                #
-                # Distinguish the two cases with sys.frozen (set by
-                # PyInstaller / zipapp / similar). For source checkouts the
-                # `[sys.executable] + sys.argv` form is the canonical CPython
-                # re-exec idiom (same shape Flask/Django reloaders use) and
-                # is the correct path.
+                #     etc.): sys.argv[0] == sys.executable == <binary>, so the
+                #     binary itself is the canonical entrypoint and is re-run
+                #     as-is.
                 #
                 # IMPORTANT: On Windows, os.execv() does NOT replace the
                 # current process — it spawns a new process while the old
                 # one keeps running.  This causes "address already in use"
                 # because the old process still holds the port.  On Windows
                 # we use subprocess.Popen() + os._exit() instead.
+                args, cwd, env = _restart_command()
                 if sys.platform == 'win32':
                     import subprocess
-                    if getattr(sys, "frozen", False):
-                        args = sys.argv
-                    else:
-                        args = [sys.executable] + sys.argv
-                    # Prefer pythonw.exe over python.exe so the restarted
-                    # server does not create a visible console window.
-                    # sys.executable may point at python.exe (console
-                    # subsystem); substitute pythonw.exe if it exists
-                    # next to python.exe.
-                    _exe = sys.executable
-                    if _exe.lower().endswith('python.exe'):
-                        _w_exe = _exe[:-4] + 'w.exe'  # python.exe -> pythonw.exe
-                        if os.path.isfile(_w_exe):
-                            if getattr(sys, "frozen", False):
-                                args = sys.argv
-                            else:
-                                args = [_w_exe] + sys.argv
-                    # Start new process fully detached with NO console
-                    # window.  DETACHED_PROCESS alone is not sufficient
-                    # on modern Windows — without CREATE_NO_WINDOW a
-                    # python.exe (console-subsystem) child still flashes
-                    # an empty terminal window, which the user then
-                    # manually kills (taking the WebUI with it).
+                    supervisor = _detect_supervisor()
+                    if supervisor:
+                        # The supervisor owns replacement: exit cleanly and
+                        # let its restart policy respawn the server. Spawning
+                        # a detached child here would duplicate the server —
+                        # the supervisor also respawns on our exit — and
+                        # orphan a process pair. No supervisor command is
+                        # invoked; teardown stays owned by the supervisor
+                        # contract.
+                        logger.info(
+                            "Self-update restart under supervisor (%s): exiting "
+                            "cleanly; supervisor will respawn the server",
+                            supervisor,
+                        )
+                        os._exit(0)
+                    # Start the replacement with NO console window.  On
+                    # Windows, DETACHED_PROCESS + CREATE_NO_WINDOW is a trap:
+                    # MSDN specifies CREATE_NO_WINDOW is IGNORED when
+                    # DETACHED_PROCESS is set, so a console-subsystem child
+                    # (the venv python/pythonw shims are both console
+                    # subsystem) allocates a PERSISTENT VISIBLE console that
+                    # hosts the restarted server. Closing that console kills
+                    # the server. The working pattern (used by the gateway
+                    # spawn in hermes_cli/gateway_windows.py) is
+                    # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW WITHOUT
+                    # DETACHED_PROCESS: the child owns a hidden console,
+                    # survives the parent's exit, and shows nothing.
                     subprocess.Popen(
                         args,
-                        cwd=os.getcwd(),
+                        cwd=cwd,
+                        env=env,
                         creationflags=(
-                            subprocess.DETACHED_PROCESS
-                            | subprocess.CREATE_NEW_PROCESS_GROUP
+                            subprocess.CREATE_NEW_PROCESS_GROUP
                             | subprocess.CREATE_NO_WINDOW
                         ),
                         close_fds=True,
@@ -1797,14 +1875,13 @@ def _schedule_restart(delay: float = 2.0) -> None:
                     # this process dies, allowing the new process to bind.
                     os._exit(0)
                 else:
-                    if getattr(sys, "frozen", False):
-                        os.execv(sys.executable, sys.argv)
-                    else:
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                    os.execv(args[0], args)
             except Exception:
-                # Last-resort: if execv fails for any reason, just exit so the
-                # process supervisor (start.sh / Docker) restarts us.
-                os._exit(0)
+                # Honest failure: the replacement did not start.  Log the
+                # error and exit non-zero so a supervisor (start.sh / Docker /
+                # systemd) sees a real failure instead of a silent success.
+                logger.exception("Self-update restart failed to spawn the replacement process")
+                os._exit(1)
 
     threading.Thread(target=_do, daemon=True).start()
 
@@ -2087,6 +2164,56 @@ def _restore_stash_after_pull_failure(
     )
 
 
+def _flag_desktop_rebuild_if_needed(agent_dir: Path) -> None:
+    """Write the desktop-rebuild-pending marker when a pull advanced desktop source.
+
+    The nightly agent pull (`git pull --ff-only`) moves only the Python source
+    tree; the packaged desktop bundle (`release/win-unpacked/app.asar`) is
+    compiled at build time and cannot be rebuilt while the app is running
+    (electron-builder replaces the live Hermes.exe). If the pull advanced any
+    commit touching ``apps/desktop/``, the running desktop's next launch would
+    serve an old renderer over a new runtime — silently stranding desktop
+    features (exactly the failure `bundle-skew.ts` exists to detect).
+
+    Fix: write a marker at ``HERMES_HOME/.hermes-desktop-rebuild-pending``
+    (the same root the desktop resolves). The desktop checks it at startup and
+    hands off to its own update flow (``hermes update`` → rebuild → relaunch),
+    which clears it. Best-effort: any failure here must never block the update
+    response, so we swallow exceptions and log.
+    """
+    try:
+        agent_path = Path(agent_dir)
+        if not agent_path.exists():
+            return
+
+        # Did the pull advance any commit touching apps/desktop/? Cheap check:
+        # HEAD^..HEAD scoped to apps/desktop (the pull was ff-only, so exactly
+        # the new commits are in this range; a no-op pull has none).
+        changed, ok = _run_git(
+            ['diff', '--name-only', 'HEAD@{1}', 'HEAD', '--', 'apps/desktop'],
+            agent_path,
+            timeout=10,
+        )
+        if not ok or not changed.strip():
+            return
+
+        # The desktop resolves HERMES_HOME and its agent root as
+        # HERMES_HOME/hermes-agent; agent_dir is exactly that root, so its
+        # parent IS HERMES_HOME regardless of env/registry path resolution.
+        # Writing there means both sides agree on the marker location.
+        marker = agent_path.parent / '.hermes-desktop-rebuild-pending'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            'Desktop bundle is stale relative to the agent source tree pulled '
+            'by the nightly auto-update. The desktop app will rebuild itself '
+            'on its next launch.\n',
+            encoding='utf-8',
+        )
+        logger.info('Wrote desktop-rebuild marker %s after agent pull touched apps/desktop', marker)
+    except Exception:
+        logger.exception('Failed to write desktop-rebuild-pending marker (non-fatal)')
+
+
 def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
     """Inner implementation of apply_update, called under _apply_lock."""
     channel = _normalize_channel(channel)
@@ -2365,6 +2492,14 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
                 'target': target,
                 'gateway_restart': gateway_result.get('status'),
             }
+        # The nightly agent pull only moves the Python source tree. If it
+        # advanced apps/desktop/ source, the packaged desktop bundle is now
+        # stale relative to the runtime — the desktop must rebuild itself on
+        # its next launch (it cannot rebuild while running; electron-builder
+        # cannot replace a live Hermes.exe). Write a marker the desktop
+        # startup checks, so a nightly pull can't silently strand desktop
+        # features behind an old renderer.
+        _flag_desktop_rebuild_if_needed(path)
 
     # Schedule a self-restart so the updated code is loaded fresh.  A plain
     # git pull leaves stale Python modules in sys.modules — agent imports that

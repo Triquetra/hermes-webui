@@ -2979,6 +2979,90 @@ function closeKanbanTaskDetail(){
   if (board) board.querySelectorAll('.kanban-card').forEach(card => card.classList.remove('selected'));
 }
 
+async function openKanbanInteractiveSession(taskId, profileName, isBlocked){
+  if(!taskId || !profileName) return;
+  // If the task is blocked, try fork-resume first.
+  if(isBlocked){
+    const btn = document.querySelector('.kanban-interactive-action .btn.primary');
+    if(btn){
+      btn.classList.add('loading');
+      btn.disabled = true;
+      btn.textContent = (t('kanban_fork_resume_loading') || 'Forking session…');
+    }
+    try{
+      const forkRes = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/fork' + _kanbanBoardQuery(), {
+        method: 'POST',
+        body: JSON.stringify({}),
+        timeoutMs: 25000,
+        retries: 1,
+      });
+      if(forkRes && forkRes.session_id){
+        // Fork succeeded — switch profile, load the session, open chat.
+        try{
+          if(typeof switchToProfile === 'function'){
+            await switchToProfile(forkRes.profile || profileName);
+          }
+        }catch(e){
+          showToast('Profile switch failed: ' + (e.message || e), 3000, 'error');
+          if(btn){ btn.classList.remove('loading'); btn.disabled = false; btn.textContent = (t('kanban_open_interactive') || 'Open interactive session'); }
+          return;
+        }
+        try{
+          if(typeof loadSession === 'function'){
+            await loadSession(forkRes.session_id);
+            if(typeof renderSessionList === 'function') await renderSessionList();
+          }
+        }catch(e){
+          showToast('Failed to open forked session: ' + (e.message || e), 3000, 'error');
+          if(btn){ btn.classList.remove('loading'); btn.disabled = false; btn.textContent = (t('kanban_open_interactive') || 'Open interactive session'); }
+          return;
+        }
+        if(typeof switchPanel === 'function'){
+          await switchPanel('chat');
+        }
+        const msgInput = $('msg');
+        if(msgInput) msgInput.focus();
+        return;
+      }
+    }catch(forkErr){
+      // Non-blocking fallback notice.
+      const notice = (t('kanban_fork_resume_fallback') || 'Fork unavailable; starting fresh session.');
+      if(typeof showToast === 'function') showToast(notice + ' ' + (forkErr.message || forkErr), 4000, 'info');
+    }finally{
+      if(btn){ btn.classList.remove('loading'); btn.disabled = false; }
+    }
+  }
+  // Interim behaviour (fresh session + brief) — used for non-blocked tasks
+  // and as fallback when fork fails.
+  try{
+    if(typeof switchToProfile === 'function'){
+      await switchToProfile(profileName);
+    }
+  }catch(e){
+    showToast('Profile switch failed: ' + (e.message || e), 3000, 'error');
+    return;
+  }
+  try{
+    if(typeof newSession === 'function'){
+      await newSession(false, {worktree: false});
+      if(typeof renderSessionList === 'function') await renderSessionList();
+    }
+  }catch(e){
+    showToast('New session failed: ' + (e.message || e), 3000, 'error');
+    return;
+  }
+  const prompt = `Work kanban task ${taskId} with me interactively — read the card, do what's needed, and confirm with me before each write.`;
+  const msgInput = $('msg');
+  if(msgInput){
+    msgInput.value = prompt;
+    if(typeof autoResize === 'function') autoResize();
+  }
+  if(typeof switchPanel === 'function'){
+    await switchPanel('chat');
+  }
+  if(msgInput) msgInput.focus();
+}
+
 function _kanbanFormatTimestamp(value){
   if (value === undefined || value === null || value === '') return '';
   let date = null;
@@ -3729,6 +3813,12 @@ function _kanbanRenderTaskDetail(data){
   const statusButtons = ['triage', 'todo', 'ready', 'blocked', 'done', 'archived'].map(status =>
     `<button class="btn secondary" onclick="updateKanbanTask('${esc(task.id)}',{status:'${status}'})">${esc(_kanbanColumnLabel(status))}</button>`
   ).join('') + `<button class="btn secondary" onclick="blockKanbanTask('${esc(task.id)}')">${esc(t('kanban_block'))}</button><button class="btn secondary" onclick="unblockKanbanTask('${esc(task.id)}')">${esc(t('kanban_unblock'))}</button>`;
+  const hasAssignee = !!(task.assignee);
+  const isBlocked = task.status === 'blocked';
+  const forkTooltip = esc(t('kanban_fork_resume_tooltip') || "Inherits the worker's exploration — what it tried, what it found, where it got stuck");
+  const interactiveAction = hasAssignee
+    ? `<div class="kanban-interactive-action"><button class="btn primary ${isBlocked ? 'has-tooltip has-tooltip--bottom' : ''}" ${isBlocked ? `data-tooltip="${forkTooltip}"` : ''} onclick="openKanbanInteractiveSession('${esc(task.id)}','${esc(task.assignee)}',${isBlocked ? 'true' : 'false'})">${esc(t('kanban_open_interactive') || 'Open interactive session')}</button></div>`
+    : '';
   return `<div class="kanban-task-preview-header">
       <button class="btn secondary kanban-back-btn" onclick="closeKanbanTaskDetail()">${esc(t('kanban_back_to_board'))}</button>
       <div class="kanban-task-preview-title">${esc(title)}</div>
@@ -3737,6 +3827,7 @@ function _kanbanRenderTaskDetail(data){
     <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     <div class="kanban-status-actions">${statusButtons}</div>
+    ${interactiveAction}
     <div class="kanban-detail-grid">
       ${_kanbanDetailSection('kanban-detail-comments', String(t('kanban_comments_count')).replace('{0}', comments.length), comments.map(_kanbanCommentHtml).join(''), 'kanban_no_comments')}
       ${_kanbanDetailSection('kanban-detail-events', String(t('kanban_events_count')).replace('{0}', events.length), events.map(_kanbanEventHtml).join(''), 'kanban_no_events')}

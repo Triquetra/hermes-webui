@@ -3515,6 +3515,20 @@ def _filter_reasoning_efforts_for_provider(
         return normalized
     if zai_supports is False:
         return []
+    # Ollama Cloud only advertises a discrete 3-mode thinking contract for
+    # DeepSeek V4 (Non-Think / High / Max), documented on the model page and
+    # empirically verified against its /v1/chat/completions endpoint. The API
+    # accepts {low, medium, high, max, none}, but measured reasoning-token
+    # volume is statistically indistinguishable across low/medium/high (run-to-
+    # run noise swamps any tier difference) while 'max' produces ~2x thinking
+    # tokens. Advertising the generic ladder therefore offers fake tiers:
+    # 'minimal' 400s, 'xhigh' 400s (undocumented), and low/medium/high are
+    # effectively one bucket. Collapse the ladder to the model's real choices:
+    # 'high' (the on/thinking mode the docs name) and 'max'. 'none'/'Default'
+    # are meta-options the composer always shows separately. The sibling
+    # deepseek and opencode-zen providers target the same backend.
+    if provider in {"ollama-cloud", "ollama_cloud", "ollama"} and "deepseek" in bare and "v4" in bare:
+        return [eff for eff in normalized if eff in {"high", "max"}]
     return normalized
 
 

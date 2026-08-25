@@ -1,7 +1,10 @@
 """Tests for self-update diagnostics (api/updates.py)."""
 import json
 import os
+import sys
+import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1388,3 +1391,257 @@ def test_apply_update_pull_lock_no_stash_when_clean(tmp_path, monkeypatch):
     # No stash pop on a clean pull-lock path.
     assert not any(c[0] == 'stash' for c in git_calls)
 
+
+
+def test_flag_desktop_rebuild_writes_marker_when_desktop_changed(tmp_path, monkeypatch):
+    """A pull advancing apps/desktop/ writes the rebuild-pending marker."""
+    (tmp_path / 'hermes-agent' / '.git').mkdir(parents=True)
+    agent_dir = tmp_path / 'hermes-agent'
+
+    def fake_git(args, cwd, timeout=10):
+        if args[0] == 'diff' and 'apps/desktop' in args:
+            return 'apps/desktop/src/app/chat/composer/model-pill.tsx\n', True
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    monkeypatch.setattr(updates, '_run_git', fake_git)
+
+    updates._flag_desktop_rebuild_if_needed(agent_dir)
+
+    marker = tmp_path / '.hermes-desktop-rebuild-pending'
+    assert marker.exists()
+    assert 'rebuild' in marker.read_text(encoding='utf-8').lower()
+
+
+def test_flag_desktop_rebuild_no_marker_when_desktop_unchanged(tmp_path, monkeypatch):
+    """A pull that does not touch apps/desktop/ must not write the marker."""
+    (tmp_path / 'hermes-agent' / '.git').mkdir(parents=True)
+    agent_dir = tmp_path / 'hermes-agent'
+
+    def fake_git(args, cwd, timeout=10):
+        if args[0] == 'diff' and 'apps/desktop' in args:
+            return '', True
+        raise AssertionError(f'unexpected git args: {args!r}')
+
+    monkeypatch.setattr(updates, '_run_git', fake_git)
+
+    updates._flag_desktop_rebuild_if_needed(agent_dir)
+
+    assert not (tmp_path / '.hermes-desktop-rebuild-pending').exists()
+
+
+# ---------------------------------------------------------------------------
+# #7195 — Windows self-restart regression: exactly one canonical replacement
+# command, honest spawn-failure behavior, no process-tree kill, no
+# hard-coded supervisor command.
+#
+# These tests run on Windows with NO real process spawn. They rely on the
+# suite-wide process-replacement boundary installed by tests/conftest.py
+# (pinned by tests/test_pytest_execv_guard.py): exec-family calls are
+# dropped unconditionally, os._exit/_Exit are dropped from daemon threads,
+# and subprocess.Popen is dropped from win32 daemon threads — so a real
+# _schedule_restart daemon thread can never replace the pytest process.
+# The behavioral tests below therefore exercise the restart thread with
+# the replacement calls monkeypatched to recording stubs, and the
+# source-level pins assert the contract structurally.
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsRestartRegression:
+    """#7195: the win32 self-restart must construct exactly ONE canonical
+    replacement command and never replay the launcher's sys.argv.
+
+    The replacement calls are monkeypatched to recording stubs (which take
+    precedence over the suite-wide boundary for the test's lifetime, per
+    tests/conftest.py). The os._exit stub records the code and then parks
+    the daemon thread on an event — exactly like the real os._exit, which
+    never returns — so the thread stops at the exit point and the recorded
+    calls prove the exact spawn/exit sequence. No real process is ever
+    spawned.
+    """
+
+    @staticmethod
+    def _expected_source_exe():
+        """Mirror _restart_command(): pythonw.exe sibling on win32 when present."""
+        exe = sys.executable
+        if sys.platform == 'win32' and exe.lower().endswith('python.exe'):
+            w_exe = exe[:-4] + 'w.exe'
+            if os.path.isfile(w_exe):
+                exe = w_exe
+        return exe
+
+    def _run_restart_thread(self, monkeypatch, argv=None, supervisor=None, popen_impl=None):
+        import api.updates as upd
+
+        spawns = []
+        monkeypatch.setattr(sys, 'platform', 'win32')
+        if argv is not None:
+            monkeypatch.setattr(sys, 'argv', argv)
+        # Per-test lock: the parked restart thread holds it forever (it never
+        # returns past the exit point), so it must not be the real _apply_lock
+        # or every later _schedule_restart in the session would block.
+        monkeypatch.setattr(upd, '_apply_lock', threading.Lock())
+        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
+        monkeypatch.setattr(upd, '_purge_agent_pycache', lambda *a, **k: None)
+        monkeypatch.setattr(upd, '_detect_supervisor', lambda: supervisor)
+        if popen_impl is None:
+            popen_impl = lambda *a, **k: spawns.append(('Popen', a, k)) or MagicMock()
+        monkeypatch.setattr(upd.subprocess, 'Popen', popen_impl)
+        # os._exit never returns: record the code, then park the daemon thread
+        # forever so it cannot fall through past the exit point and record
+        # spurious calls.
+        monkeypatch.setattr(
+            upd.os, '_exit',
+            lambda code: (spawns.append(('_exit', code)), threading.Event().wait())[-1],
+        )
+
+        upd._schedule_restart(delay=0.01)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not spawns:
+            time.sleep(0.02)
+        return spawns
+
+    def test_restart_thread_constructs_exactly_one_replacement_command(self, monkeypatch):
+        """The restart daemon thread must build exactly one replacement
+        command and hand it to exactly one spawn call.
+
+        Regression for #7195: the pre-fix win32 branch replayed sys.argv
+        (a fixed-point fork-bomb under pytest) and every attempt orphaned
+        a process pair. The fixed branch resolves ONE canonical command via
+        _restart_command() and spawns it exactly once.
+        """
+        spawns = self._run_restart_thread(monkeypatch)
+
+        popens = [s for s in spawns if s[0] == 'Popen']
+        assert len(popens) == 1, f'exactly one Popen expected, got {len(popens)}: {spawns!r}'
+        _, args, kwargs = popens[0]
+        assert args[0] == [self._expected_source_exe(), str(updates.REPO_ROOT / 'server.py')], (
+            f'replacement must be the canonical [pythonw|python, REPO_ROOT/server.py], got {args[0]!r}'
+        )
+        assert kwargs.get('cwd') == str(updates.REPO_ROOT)
+        assert kwargs.get('env') is not None and kwargs['env'] is not os.environ
+        assert kwargs.get('creationflags', 0) & getattr(updates.subprocess, 'CREATE_NO_WINDOW', 0), (
+            'win32 replacement must keep CREATE_NO_WINDOW (#4626)'
+        )
+        assert not kwargs.get('creationflags', 0) & getattr(updates.subprocess, 'DETACHED_PROCESS', 0), (
+            'DETACHED_PROCESS must not be used (CREATE_NO_WINDOW is ignored when it is set)'
+        )
+        assert ('_exit', 0) in spawns, 'a successful spawn must be followed by os._exit(0)'
+
+    def test_restart_thread_never_replays_launcher_argv(self, monkeypatch):
+        """The replacement command must be canonical regardless of how the
+        process was launched — pytest, python -m, bootstrap, or a wrapper.
+
+        Regression for #7195: replaying sys.argv re-runs the launcher
+        (pytest -> fixed-point fork-bomb; bootstrap -> wrapper re-run).
+        """
+        spawns = self._run_restart_thread(
+            monkeypatch,
+            argv=[r'C:\venv\Scripts\pytest.exe', 'tests/test_updates.py'],
+        )
+
+        popens = [s for s in spawns if s[0] == 'Popen']
+        assert len(popens) == 1, f'exactly one Popen expected, got {len(popens)}: {spawns!r}'
+        _, args, _ = popens[0]
+        assert 'pytest' not in args[0][0].lower(), (
+            f'launcher argv leaked into the replacement command: {args[0]!r}'
+        )
+        assert args[0] == [self._expected_source_exe(), str(updates.REPO_ROOT / 'server.py')]
+
+    def test_restart_thread_under_supervisor_exits_cleanly_without_spawn(self, monkeypatch):
+        """Under a supervisor, the win32 restart must NOT spawn a detached
+        child (duplicate server + orphan pair); it exits cleanly and lets
+        the supervisor respawn. No supervisor command is invoked."""
+        spawns = self._run_restart_thread(monkeypatch, supervisor='INVOCATION_ID')
+
+        assert ('_exit', 0) in spawns, 'under a supervisor the restart must exit cleanly'
+        assert not any(s[0] == 'Popen' for s in spawns), (
+            'under a supervisor the restart must NOT spawn a replacement process'
+        )
+
+    def test_restart_thread_propagates_spawn_failure_with_nonzero_exit(self, monkeypatch):
+        """A failed spawn must be logged and exit non-zero — no silent
+        retry, no recursion, no swallowed failure.
+
+        Regression for #7195: the pre-fix blanket `except: os._exit(0)`
+        reported success when the replacement never started.
+        """
+        import api.updates as upd
+
+        logged = []
+
+        def failing_popen(*a, **k):
+            raise OSError('spawn failed')
+
+        monkeypatch.setattr(upd.logger, 'exception', lambda *a, **k: logged.append(a))
+        spawns = self._run_restart_thread(monkeypatch, popen_impl=failing_popen)
+
+        assert ('_exit', 1) in spawns, (
+            f'spawn failure must exit non-zero (honest failure), got {spawns!r}'
+        )
+        assert ('_exit', 0) not in spawns, 'a failed spawn must never exit 0'
+        assert logged, 'spawn failure must be logged via logger.exception'
+        assert len(spawns) == 1, (
+            f'no silent retry/recursion allowed: exactly one exit, got {spawns!r}'
+        )
+
+
+class TestWindowsRestartSourceContract:
+    """Structural pins for the #7195 fix in api/updates.py.
+
+    These complement the behavioral tests above: a future refactor cannot
+    silently reintroduce sys.argv replay, an unconditional process-tree
+    kill, a hard-coded supervisor command, or a silent success exit.
+    """
+
+    UPDATES_PY = (Path(__file__).resolve().parent.parent / 'api' / 'updates.py').read_text(encoding='utf-8')
+
+    def test_no_sys_argv_replay_in_restart_command(self):
+        for replay in (
+            'args = [sys.executable] + sys.argv',
+            'args = [_w_exe] + sys.argv',
+            'os.execv(sys.executable, sys.argv)',
+            'os.execv(sys.executable, [sys.executable] + sys.argv)',
+        ):
+            assert replay not in self.UPDATES_PY, (
+                f'sys.argv replay reintroduced in api/updates.py: {replay}'
+            )
+
+    def test_restart_command_resolves_canonical_entrypoint(self):
+        assert 'return [exe, str(REPO_ROOT / "server.py")], str(REPO_ROOT), os.environ.copy()' in self.UPDATES_PY, (
+            'the source branch of _restart_command() must resolve the canonical '
+            '[pythonw|python, REPO_ROOT/server.py] command'
+        )
+        assert 'return list(sys.argv), os.getcwd(), os.environ.copy()' in self.UPDATES_PY, (
+            'the frozen branch must re-run the binary argv as-is'
+        )
+
+    def test_restart_wiring_uses_restart_command(self):
+        assert 'args, cwd, env = _restart_command()' in self.UPDATES_PY, (
+            '_schedule_restart must resolve the replacement via _restart_command()'
+        )
+
+    def test_no_unconditional_process_tree_kill(self):
+        for kill in ('taskkill', 'killpg', 'os.kill(', '.terminate()'):
+            assert kill not in self.UPDATES_PY, (
+                f'unconditional process-tree kill reintroduced in api/updates.py: {kill}'
+            )
+
+    def test_no_hard_coded_supervisor_command(self):
+        for cmd in ('systemctl', 'supervisorctl', 'launchctl'):
+            assert cmd not in self.UPDATES_PY, (
+                f'hard-coded supervisor command reintroduced: {cmd}'
+            )
+
+    def test_no_detached_process_flag(self):
+        assert 'CREATE_DETACHED_PROCESS' not in self.UPDATES_PY, (
+            'DETACHED_PROCESS must not be used: CREATE_NO_WINDOW is ignored '
+            'when DETACHED_PROCESS is set (#4626)'
+        )
+
+    def test_honest_failure_exits_nonzero(self):
+        assert 'os._exit(1)' in self.UPDATES_PY
+        assert 'logger.exception' in self.UPDATES_PY
+        assert 'except Exception:' in self.UPDATES_PY
+
+    def test_success_path_exits_zero(self):
+        assert 'os._exit(0)' in self.UPDATES_PY

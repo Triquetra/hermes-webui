@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 _GATEWAY_RESTART_LOCK = threading.Lock()
 
 
+def _windows_hide_flags() -> int:
+    """Win32 ``creationflags`` that hide a console child's window.
+
+    ``hermes`` is a console-subsystem executable, so spawning it without
+    ``CREATE_NO_WINDOW`` flashes a visible console window. When the gateway
+    restart runs in the background (the ``in_progress`` path), that console
+    persists as a perpetual process the user may close — killing the gateway
+    and the WebUI it hosts. Returns ``0`` on non-Windows (a genuine no-op).
+    Mirrors the pattern in ``api/workspace_git.py`` / ``api/updates.py``.
+    """
+    if sys.platform == "win32":
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return 0
+
+
 def _resolve_hermes_command() -> str:
     """Resolve the CLI path used for active-profile gateway restarts."""
     hermes_cmd = shutil.which("hermes")
@@ -123,6 +138,7 @@ def restart_active_profile_gateway(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            creationflags=_windows_hide_flags(),
         )
 
         try:

@@ -525,6 +525,52 @@ def _task_detail_payload(task_id: str, *, board=None):
         }
 
 
+def _fork_task_payload(task_id: str, body: dict, *, board=None):
+    """Fork-resume a blocked task into a new interactive session.
+
+    Steps (mirrors CLI ``hermes kanban fork``):
+      1. release_task_claim — no-op if already clear (blocked), but
+         required for running→fork races.
+      2. create_fork_session — fresh ``cli``-source session seeded with
+         the worker's context + log tail.
+
+    Returns ``{"session_id": <sid>, "profile": <name>}`` on success, or
+    raises a 4xx/5xx error on failure so the frontend can fall back.
+    """
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    kb = _kb()
+    with _conn(board=board) as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            raise LookupError("task not found")
+        assignee = (body.get("profile") if isinstance(body, dict) else None) or task.assignee
+        if not assignee:
+            raise ValueError("task has no assignee; pass profile to fork as")
+        # 1. Release claim (idempotent — blocked tasks already have none).
+        if hasattr(kb, "release_task_claim"):
+            kb.release_task_claim(conn, task_id)
+        # 2. Create the forked session.
+        if not hasattr(kb, "create_fork_session"):
+            raise RuntimeError("kanban_db too old — create_fork_session unavailable")
+        log_tail = body.get("tail") if isinstance(body, dict) else None
+        try:
+            log_tail_bytes = int(log_tail) if log_tail is not None else None
+        except (TypeError, ValueError):
+            log_tail_bytes = None
+        new_session_id = kb.create_fork_session(
+            conn,
+            task_id,
+            log_tail_bytes=log_tail_bytes,
+            board=board,
+            profile=assignee,
+        )
+        if not new_session_id:
+            raise RuntimeError("fork failed — could not create the forked session")
+    return {"session_id": new_session_id, "task_id": task_id, "profile": assignee, "read_only": False}
+
+
 def _events_payload(parsed):
     """Return paginated task events from the board's event log, starting after the ?since= cursor."""
     board = _resolve_board(parsed)
@@ -1242,6 +1288,9 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
         if path.startswith(_TASK_PREFIX) and path.endswith("/comments"):
             task_id = path[len(_TASK_PREFIX):-len("/comments")].strip("/")
             return j(handler, _comment_payload(task_id, body, board=board)) or True
+        if path.startswith(_TASK_PREFIX) and path.endswith("/fork"):
+            task_id = path[len(_TASK_PREFIX):-len("/fork")].strip("/")
+            return j(handler, _fork_task_payload(task_id, body, board=board)) or True
         for suffix, action in (("/block", "block"), ("/unblock", "unblock")):
             if path.startswith(_TASK_PREFIX) and path.endswith(suffix):
                 task_id = path[len(_TASK_PREFIX):-len(suffix)].strip("/")

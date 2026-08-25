@@ -21,6 +21,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -424,35 +425,227 @@ def pytest_report_collectionfinish(config, items):
 # imports trigger botocore initialisation.
 os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 
-# ── Permanent os.execv guard for the pytest session ────────────────────────
+# ── Permanent process-replacement guard for the pytest session ─────────────
 # Several tests in tests/test_update_banner_fixes.py exercise
 # api.updates._schedule_restart(), which spawns a DAEMON thread that sleeps
-# for a short delay and then calls ``os.execv(sys.executable, sys.argv)``.
-# Those tests monkeypatch ``os.execv`` to a no-op for the test scope, but
-# monkeypatch teardown happens at test exit — if the daemon thread has not
-# yet woken up by then (system load, GC pause, _apply_lock contention), the
-# real ``os.execv`` is restored before the thread fires it. The daemon then
-# REPLACES the pytest process image with a fresh ``pytest tests/ -q ...``
-# invocation, looking from the outside like pytest "hangs at 99%" and then
-# restarts the entire suite from 0% — a self-perpetuating loop.
+# for a short delay and then replaces the current process (os.execv on
+# POSIX; subprocess.Popen + os._exit on Windows). Those tests monkeypatch
+# the replacement calls to no-ops for the test scope, but monkeypatch
+# teardown happens at test exit — if the daemon thread has not yet woken up
+# by then (system load, GC pause, _apply_lock contention), the real call is
+# restored before the thread fires it. The daemon then REPLACES the pytest
+# process image with a fresh ``pytest tests/ -q ...`` invocation (POSIX) or
+# spawns a detached pytest child and hard-exits the runner (Windows),
+# looking from the outside like pytest "hangs at 99%" and then restarts the
+# entire suite from 0% — a self-perpetuating loop.
 #
 # Daemon threads cannot be reliably joined from a test fixture (they live in
-# ``api.updates`` module scope), so the only safe answer is to render
-# ``os.execv`` permanently inert for the pytest session. Production code is
-# unaffected because production never imports this conftest.
+# ``api.updates`` module scope), so the only safe answer is to render every
+# process-replacement mechanism permanently inert for the pytest session.
+# Production code is unaffected because production never imports this
+# conftest.
 #
-# Tests that need to verify execv WAS called still monkeypatch it themselves
-# — their patched version takes precedence over this no-op wrapper for the
-# test's lifetime, and the no-op only kicks in after teardown for daemon
+# The boundary is deliberately NARROW so it cannot interfere with normal
+# test execution:
+#   * exec-family calls (os.execv/execve/execl/execle/execlp/execlpe/
+#     execvp/execvpe) are dropped unconditionally — they can only replace
+#     the pytest process itself, which no test ever needs.
+#   * os._exit / os._Exit are dropped ONLY from daemon threads. The main
+#     thread and non-daemon threads keep the real call: pytest-timeout's
+#     hard-kill timer thread (non-daemon) must still be able to terminate a
+#     hung test, and multiprocessing fork children (which run on the main
+#     thread of a forked copy) must still exit normally.
+#   * subprocess.Popen is dropped ONLY from daemon threads on win32 — the
+#     only daemon-thread Popen in the codebase is the Windows restart
+#     branch of _schedule_restart. POSIX keeps Popen everywhere: the
+#     embedded-terminal supervisor thread (api/terminal.py) is a daemon
+#     that legitimately spawns shells, and the test-server fixture spawns
+#     the server from the main thread.
+#
+# Every blocked attempt is recorded in ``_PROCESS_REPLACEMENT_ATTEMPTS`` so
+# tests can assert on the would-be replacement command (see
+# tests/test_pytest_execv_guard.py).
+#
+# Tests that need to verify a replacement call WAS made still monkeypatch it
+# themselves — their patched version takes precedence over this guard for the
+# test's lifetime, and the guard only kicks in after teardown for daemon
 # threads that wake up late.
-_real_execv = os.execv
+#
+# DOUBLE-IMPORT IDEMPOTENCY: pytest loads this file BOTH as `tests.conftest`
+# (package conftest at startup) and as bare `conftest` (test files doing
+# `from conftest import ...` with tests/ on sys.path). A second execution
+# must NOT create a second guard class / attempts list or re-wrap
+# subprocess.Popen — that would break identity-based pin tests and split the
+# recorded attempts across two lists. The sentinel lives on the subprocess
+# module, which is shared by both module objects.
+if not getattr(subprocess, "_HERMES_PYTEST_REPLACEMENT_GUARD", None):
+    _real_execv = os.execv
+    _real_execve = getattr(os, "execve", None)
+    _real_execl = getattr(os, "execl", None)
+    _real_execle = getattr(os, "execle", None)
+    _real_execlp = getattr(os, "execlp", None)
+    _real_execlpe = getattr(os, "execlpe", None)
+    _real_execvp = getattr(os, "execvp", None)
+    _real_execvpe = getattr(os, "execvpe", None)
+    _real_exit = os._exit
+    _real_Exit = getattr(os, "_Exit", None)
+    _real_Popen = subprocess.Popen
 
-def _pytest_session_safe_execv(_exe, _args):  # pragma: no cover — never called in prod
-    # Drop the call on the floor. A late-firing daemon thread from
-    # _schedule_restart() must not be able to re-exec the pytest process.
-    return None
+    _PROCESS_REPLACEMENT_ATTEMPTS: list[dict] = []
 
-os.execv = _pytest_session_safe_execv
+    def _record_replacement(kind: str, detail: dict) -> None:
+        """Record a blocked process-replacement attempt for test inspection."""
+        try:
+            _PROCESS_REPLACEMENT_ATTEMPTS.append(
+                {"kind": kind, "thread": threading.current_thread().name, **detail}
+            )
+        except Exception:  # pragma: no cover — never allowed to break the suite
+            pass
+
+    def _pytest_session_safe_execv(_exe, _args):  # pragma: no cover — never called in prod
+        # Drop the call on the floor. A late-firing daemon thread from
+        # _schedule_restart() must not be able to re-exec the pytest process.
+        _record_replacement("execv", {"exe": _exe, "args": list(_args) if _args is not None else None})
+        return None
+
+    def _pytest_session_safe_execve(_exe, _args, _env):  # pragma: no cover
+        _record_replacement("execve", {"exe": _exe, "args": list(_args) if _args is not None else None})
+        return None
+
+    def _pytest_session_safe_execl(_exe, *_args):  # pragma: no cover
+        _record_replacement("execl", {"exe": _exe, "args": list(_args)})
+        return None
+
+    def _pytest_session_safe_execle(_exe, *_args):  # pragma: no cover
+        _record_replacement("execle", {"exe": _exe, "args": list(_args)})
+        return None
+
+    def _pytest_session_safe_execlp(_exe, *_args):  # pragma: no cover
+        _record_replacement("execlp", {"exe": _exe, "args": list(_args)})
+        return None
+
+    def _pytest_session_safe_execlpe(_exe, *_args):  # pragma: no cover
+        _record_replacement("execlpe", {"exe": _exe, "args": list(_args)})
+        return None
+
+    def _pytest_session_safe_execvp(_exe, _args):  # pragma: no cover
+        _record_replacement("execvp", {"exe": _exe, "args": list(_args) if _args is not None else None})
+        return None
+
+    def _pytest_session_safe_execvpe(_exe, _args, _env):  # pragma: no cover
+        _record_replacement("execvpe", {"exe": _exe, "args": list(_args) if _args is not None else None})
+        return None
+
+    def _pytest_session_safe_exit(_code=0):  # pragma: no cover — never called in prod
+        # Only daemon threads are blocked: pytest-timeout's hard-kill timer
+        # (non-daemon) and multiprocessing fork children (main thread of a
+        # forked copy) must still be able to exit the process.
+        if threading.current_thread().daemon:
+            _record_replacement("os._exit", {"code": _code})
+            return None
+        return _real_exit(_code)
+
+    def _pytest_session_safe_Exit(_code=0):  # pragma: no cover
+        if threading.current_thread().daemon:
+            _record_replacement("os._Exit", {"code": _code})
+            return None
+        return _real_Exit(_code)
+
+    class _PytestSessionSafePopen(_real_Popen):
+        """subprocess.Popen guard: win32 daemon-thread spawns are dropped.
+
+        Subclasses the real Popen instead of shadowing it with a function so
+        every Popen contract keeps working: ``Popen[...]`` type annotations
+        (evaluated at runtime by e.g. mcp), ``isinstance`` checks, and all
+        instance methods. Only the constructor is intercepted — on win32 a
+        daemon-thread spawn (the Windows restart branch of _schedule_restart)
+        is recorded and dropped without creating a process; everywhere else
+        the real Popen runs untouched.
+        """
+
+        def __init__(self, *args, **kwargs):  # pragma: no cover — never called in prod
+            # win32-only daemon-thread block: the only daemon-thread Popen in
+            # the codebase is the Windows restart branch of _schedule_restart.
+            # POSIX daemon threads (api/terminal.py spawn supervisor) must keep
+            # working, and main-thread spawns (test-server fixture, every
+            # subprocess.run-based test) pass straight through.
+            if sys.platform == "win32" and threading.current_thread().daemon:
+                _record_replacement("Popen", {"args": args, "kwargs": kwargs})
+                return
+            super().__init__(*args, **kwargs)
+
+    os.execv = _pytest_session_safe_execv
+    if _real_execve is not None:
+        os.execve = _pytest_session_safe_execve
+    if _real_execl is not None:
+        os.execl = _pytest_session_safe_execl
+    if _real_execle is not None:
+        os.execle = _pytest_session_safe_execle
+    if _real_execlp is not None:
+        os.execlp = _pytest_session_safe_execlp
+    if _real_execlpe is not None:
+        os.execlpe = _pytest_session_safe_execlpe
+    if _real_execvp is not None:
+        os.execvp = _pytest_session_safe_execvp
+    if _real_execvpe is not None:
+        os.execvpe = _pytest_session_safe_execvpe
+    os._exit = _pytest_session_safe_exit
+    if _real_Exit is not None:
+        os._Exit = _pytest_session_safe_Exit
+    subprocess.Popen = _PytestSessionSafePopen
+    subprocess._HERMES_PYTEST_REPLACEMENT_GUARD = {
+        "attempts": _PROCESS_REPLACEMENT_ATTEMPTS,
+        "Popen": _PytestSessionSafePopen,
+        "real_Popen": _real_Popen,
+        "real_exit": _real_exit,
+        "real_Exit": _real_Exit,
+        "real_execv": _real_execv,
+        "real_execve": _real_execve,
+        "real_execl": _real_execl,
+        "real_execle": _real_execle,
+        "real_execlp": _real_execlp,
+        "real_execlpe": _real_execlpe,
+        "real_execvp": _real_execvp,
+        "real_execvpe": _real_execvpe,
+        "safe_exit": _pytest_session_safe_exit,
+        "safe_Exit": _pytest_session_safe_Exit,
+        "safe_execv": _pytest_session_safe_execv,
+        "safe_execve": _pytest_session_safe_execve,
+        "safe_execl": _pytest_session_safe_execl,
+        "safe_execle": _pytest_session_safe_execle,
+        "safe_execlp": _pytest_session_safe_execlp,
+        "safe_execlpe": _pytest_session_safe_execlpe,
+        "safe_execvp": _pytest_session_safe_execvp,
+        "safe_execvpe": _pytest_session_safe_execvpe,
+    }
+else:
+    # Second execution of this file (bare `conftest` vs `tests.conftest`):
+    # reuse the already-installed guard objects so identity-based pin tests
+    # and the shared attempts list stay consistent.
+    _g = subprocess._HERMES_PYTEST_REPLACEMENT_GUARD
+    _PROCESS_REPLACEMENT_ATTEMPTS = _g["attempts"]
+    _PytestSessionSafePopen = _g["Popen"]
+    _real_Popen = _g["real_Popen"]
+    _real_exit = _g["real_exit"]
+    _real_Exit = _g["real_Exit"]
+    _real_execv = _g["real_execv"]
+    _real_execve = _g["real_execve"]
+    _real_execl = _g["real_execl"]
+    _real_execle = _g["real_execle"]
+    _real_execlp = _g["real_execlp"]
+    _real_execlpe = _g["real_execlpe"]
+    _real_execvp = _g["real_execvp"]
+    _real_execvpe = _g["real_execvpe"]
+    _pytest_session_safe_exit = _g["safe_exit"]
+    _pytest_session_safe_Exit = _g["safe_Exit"]
+    _pytest_session_safe_execv = _g["safe_execv"]
+    _pytest_session_safe_execve = _g["safe_execve"]
+    _pytest_session_safe_execl = _g["safe_execl"]
+    _pytest_session_safe_execle = _g["safe_execle"]
+    _pytest_session_safe_execlp = _g["safe_execlp"]
+    _pytest_session_safe_execlpe = _g["safe_execlpe"]
+    _pytest_session_safe_execvp = _g["safe_execvp"]
+    _pytest_session_safe_execvpe = _g["safe_execvpe"]
 
 # ── Hermetic network isolation ─────────────────────────────────────────────
 # Tests must not reach the public internet. Outbound to Anthropic / OpenAI /
