@@ -1499,7 +1499,7 @@
   :root{--app-titlebar-safe-top:0px;}
   .pwa-standalone{overscroll-behavior:none;}
   .pwa-standalone body{-webkit-tap-highlight-color:transparent;}
-  .app-titlebar-new-chat{display:none;}
+  .app-titlebar-new-chat{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex-shrink:0;background:none;border:none;color:var(--muted);border-radius:8px;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent;transition:background-color .15s,color .15s;-webkit-app-region:no-drag;}
   .pwa-standalone .app-titlebar-reload{display:inline-flex;}
   .pwa-offline .app-titlebar::after{content:'';position:absolute;left:50%;bottom:5px;width:5px;height:5px;border-radius:999px;background:var(--warning);box-shadow:0 0 0 3px color-mix(in srgb,var(--warning) 22%,transparent);transform:translateX(-50%);}
   .pwa-resumed .app-titlebar-title{animation:pwa-title-resume .6s ease-out;}
@@ -1514,8 +1514,10 @@
     .pull-to-refresh-indicator.active{opacity:1;transform:translateY(0);}
     .pull-to-refresh-indicator .ptr-icon{display:inline-block;transition:transform .2s;font-size:16px;}
     .pull-to-refresh-indicator .ptr-icon.ready{transform:rotate(180deg);color:var(--accent);}
-    /* Reload and mobile new-chat titlebar controls with shared icon-button styles */
-    .app-titlebar-new-chat,
+    /* Reload and mobile new-chat titlebar controls with shared icon-button styles.
+       The new-chat button is shown on desktop too so a single click starts a new
+       conversation without opening the sidebar. */
+    .app-titlebar-new-chat{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex-shrink:0;background:none;border:none;color:var(--muted);border-radius:8px;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent;transition:background-color .15s,color .15s;-webkit-app-region:no-drag;}
     .app-titlebar-reload{display:none;align-items:center;justify-content:center;width:32px;height:32px;flex-shrink:0;background:none;border:none;color:var(--muted);border-radius:8px;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent;transition:background-color .15s,color .15s;}
     .app-titlebar-new-chat:hover,
     .app-titlebar-reload:hover{background:var(--hover-bg);color:var(--text);}
@@ -7020,6 +7022,21 @@ main.main.showing-insights > #mainInsights{display:flex;overflow-y:auto;}
   border-color:var(--accent, #FFD700);
   color:var(--accent-text, var(--accent, #FFD700));
 }
+/* Primary CTA inside the kanban task preview — accent-tinted like the modal primary. */
+.kanban-task-preview .btn.primary{
+  border-color:var(--accent, #FFD700);
+  background:var(--accent-bg, rgba(255,215,0,.12));
+  color:var(--accent-text, var(--accent, #FFD700));
+  font-weight:600;
+}
+.kanban-task-preview .btn.primary:hover{
+  background:var(--accent-bg-strong, rgba(255,215,0,.22));
+  border-color:var(--accent, #FFD700);
+  color:var(--accent-text, var(--accent, #FFD700));
+}
+.kanban-interactive-action{display:flex;gap:8px;align-items:center;margin:10px 0 4px;}
+.kanban-interactive-action .btn.loading{opacity:.7;cursor:wait;position:relative;padding-left:26px;}
+.kanban-interactive-action .btn.loading::before{content:'';position:absolute;left:8px;top:50%;transform:translateY(-50%);width:12px;height:12px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;}
 .kanban-comment-form{display:flex;gap:8px;align-items:flex-end;margin-top:12px;}
 .kanban-comment-form textarea{flex:1;min-height:42px;resize:vertical;background:var(--input-bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px;font:inherit;font-size:12px;}
 
