@@ -359,6 +359,7 @@ async function _loadSlashSkillSubArgs(force=false){
       const data=await api('/api/skills');
       const values=[];
       for(const skill of (data&&data.skills)||[]){
+        if(skill&&skill.disabled) continue;
         const name=_normalizeSlashSubArg(skill&&skill.name);
         if(name) values.push(name);
       }
@@ -2096,6 +2097,7 @@ function _getReservedSlashCommandSlugs(){
   return reserved;
 }
 function _buildSkillCommandEntry(skill){
+  if(skill&&skill.disabled) return null;
   const skillName=String(skill&&skill.name||'').trim();
   const slug=_skillCommandSlug(skillName);
   if(!slug)return null;
